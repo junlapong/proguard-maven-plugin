@@ -21,10 +21,11 @@
 package com.github.wvengen.maven.proguard;
 
 import java.io.File;
+import java.io.IOException;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 
@@ -42,6 +43,7 @@ import org.apache.tools.ant.DefaultLogger;
 import org.apache.tools.ant.Project;
 import org.apache.tools.ant.taskdefs.Java;
 import org.codehaus.plexus.archiver.jar.JarArchiver;
+import org.codehaus.plexus.util.FileUtils;
 
 /**
  *
@@ -80,6 +82,13 @@ public class ProGuardMojo extends AbstractMojo {
 	private String proguardVersion;
 
 	/**
+	 * To run DexGuard instead of ProGuard, set this to "true".
+	 *
+	 * @parameter default-value="false"
+	 */
+	private boolean useDexGuard;
+
+	/**
 	 * ProGuard configuration options
 	 *
 	 * @parameter
@@ -96,15 +105,29 @@ public class ProGuardMojo extends AbstractMojo {
 	/**
 	 * Specifies that project compile dependencies be added as -libraryjars to proguard arguments. Dependency itself is
 	 * not included in resulting jar unless you set includeDependencyInjar to true
-	 * 
+	 *
 	 * @parameter default-value="true"
 	 */
 	private boolean includeDependency;
 
+	/**
+	 * @parameter expression="${project.build.directory}/tempLibraryjars"
+	 * @readonly
+	 */
+	private File tempLibraryjarsDir;
+
+	/**
+	 * Specifies to copy all the -libraryjars dependencies into a temporary directory and pass that directory
+	 * as the only -libraryjars argument to ProGuard.
+	 *
+	 * @parameter default-value="false"
+	 */
+	private boolean putLibraryJarsInTempDir;
+
 
 	/**
 	 * Specifies that project compile dependencies should be added as injar.
-	 * 
+	 *
 	 * @parameter default-value="false"
 	 */
 	private boolean includeDependencyInjar;
@@ -129,20 +152,20 @@ public class ProGuardMojo extends AbstractMojo {
 	 *
 	 * @parameter
 	 */
-	private List<String> exclusions;
+	private List<Exclusion> exclusions;
 
 	/**
-     * Specifies the input jar name (or wars, ears, zips) of the application to be
-     * processed.
-     *
-     * You may specify a classes directory e.g. 'classes'. This way plugin will processed
-     * the classes instead of jar. You would need to bind the execution to phase 'compile'
-     * or 'process-classes' in this case.
-     *
-     * @parameter expression="${project.build.finalName}.jar"
-     * @required
-     */
-    protected String injar;
+	 * Specifies the input jar name (or wars, ears, zips) of the application to be
+	 * processed.
+	 *
+	 * You may specify a classes directory e.g. 'classes'. This way plugin will processed
+	 * the classes instead of jar. You would need to bind the execution to phase 'compile'
+	 * or 'process-classes' in this case.
+	 *
+	 * @parameter expression="${project.build.finalName}.jar"
+	 * @required
+	 */
+	protected String injar;
 
 	/**
 	 * Set this to 'true' to bypass ProGuard processing when injar does not exists.
@@ -178,7 +201,21 @@ public class ProGuardMojo extends AbstractMojo {
 	 *
 	 * @parameter default-value="false"
 	 */
-	private boolean attach = false;
+	private boolean attach;
+
+	/**
+	 * Determines if {@link #attach} also attaches the {@link #mappingFileName} file.
+	 *
+	 * @parameter default-value="false"
+	 */
+	private boolean attachMap;
+
+	/**
+	 * Determines if {@link #attach} also attaches the {@link #seedFileName} file.
+	 *
+	 * @parameter default-value="false"
+	 */
+	private boolean attachSeed;
 
 	/**
 	 * Specifies attach artifact type
@@ -233,7 +270,7 @@ public class ProGuardMojo extends AbstractMojo {
 	 * @required
 	 * @readonly
 	 */
-	protected List<String> pluginArtifacts;
+	protected List<Artifact> pluginArtifacts;
 
 	/**
 	 * @component
@@ -248,7 +285,7 @@ public class ProGuardMojo extends AbstractMojo {
 	 */
 	private JarArchiver jarArchiver;
 
-	
+
 	/**
 	 * The maven archive configuration to use. only if assembly is used.
 	 *
@@ -283,18 +320,33 @@ public class ProGuardMojo extends AbstractMojo {
 	 * @parameter default-value="proguard_seed.txt"
 	 */
 	protected String seedFileName = "proguard_seeds.txt";
-	
+
+	/**
+	 * The proguard jar to use. useful for using beta versions of
+	 * progaurd that aren't yet on Maven central.
+	 *
+	 * @parameter
+	 */
+	protected File proguardJar;
+
+	/**
+	 * If the plugin should be silent.
+	 *
+	 * @parameter default-value="false"
+	 */
+	private boolean silent;
+
 	private Log log;
 
 	/**
 	 * ProGuard docs: Names with special characters like spaces and parentheses must be quoted with single or double
 	 * quotes.
 	 */
-	private static String fileNameToString(String fileName) {
+	private String fileNameToString(String fileName) {
 		return "'" + fileName + "'";
 	}
 
-	private static String fileToString(File file) {
+	private String fileToString(File file) {
 		return fileNameToString(file.toString());
 	}
 
@@ -344,7 +396,7 @@ public class ProGuardMojo extends AbstractMojo {
 			sameArtifact = false;
 			outJarFile = (new File(outputDirectory, outjar)).getAbsoluteFile();
 			if (outJarFile.exists()) {
-			    if (!deleteFileOrDirectory(outJarFile)) {
+				if (!deleteFileOrDirectory(outJarFile)) {
 					throw new MojoFailureException("Can't delete " + outJarFile);
 				}
 			}
@@ -353,10 +405,10 @@ public class ProGuardMojo extends AbstractMojo {
 			outJarFile = inJarFile.getAbsoluteFile();
 			File baseFile;
 			if (inJarFile.isDirectory()) {
-			    baseFile = new File(outputDirectory, nameNoType(injar) + "_proguard_base");
+				baseFile = new File(outputDirectory, nameNoType(injar) + "_proguard_base");
 			} else {
-			    baseFile = new File(outputDirectory, nameNoType(injar) + "_proguard_base.jar");
-		    }
+				baseFile = new File(outputDirectory, nameNoType(injar) + "_proguard_base.jar");
+			}
 			if (baseFile.exists()) {
 				if (!deleteFileOrDirectory(baseFile)) {
 					throw new MojoFailureException("Can't delete " + baseFile);
@@ -371,22 +423,25 @@ public class ProGuardMojo extends AbstractMojo {
 		}
 
 		ArrayList<String> args = new ArrayList<String>();
+		ArrayList<File> libraryJars = new ArrayList<File>();
 
 		if (log.isDebugEnabled()) {
 			@SuppressWarnings("unchecked")
 			List<Artifact> dependancy = mavenProject.getCompileArtifacts();
-			for (Iterator<Artifact> i = dependancy.iterator(); i.hasNext();) {
-				Artifact artifact =  i.next();
+			for (Artifact artifact : dependancy) {
 				log.debug("--- compile artifact " + artifact.getGroupId() + ":" + artifact.getArtifactId() + ":"
 						+ artifact.getType() + ":" + artifact.getClassifier() + " Scope:" + artifact.getScope());
 			}
-			for (Iterator i = mavenProject.getArtifacts().iterator(); i.hasNext();) {
-				Artifact artifact = (Artifact) i.next();
+
+			@SuppressWarnings("unchecked")
+			final Set<Artifact> artifacts = mavenProject.getArtifacts();
+			for (Artifact artifact : artifacts) {
 				log.debug("--- artifact " + artifact.getGroupId() + ":" + artifact.getArtifactId() + ":"
 						+ artifact.getType() + ":" + artifact.getClassifier() + " Scope:" + artifact.getScope());
 			}
-			for (Iterator i = mavenProject.getDependencies().iterator(); i.hasNext();) {
-				Dependency artifact = (Dependency) i.next();
+			@SuppressWarnings("unchecked")
+			final List<Dependency> dependencies = mavenProject.getDependencies();
+			for (Dependency artifact : dependencies) {
 				log.debug("--- dependency " + artifact.getGroupId() + ":" + artifact.getArtifactId() + ":"
 						+ artifact.getType() + ":" + artifact.getClassifier() + " Scope:" + artifact.getScope());
 			}
@@ -394,14 +449,15 @@ public class ProGuardMojo extends AbstractMojo {
 
 		Set<String> inPath = new HashSet<String>();
 		boolean hasInclusionLibrary = false;
-		if (assembly != null) {
-			for (Iterator iter = assembly.inclusions.iterator(); iter.hasNext();) {
-				Inclusion inc = (Inclusion) iter.next();
+		if (assembly != null && assembly.inclusions != null) {
+			@SuppressWarnings("unchecked")
+			final List<Inclusion> inclusions = assembly.inclusions;
+			for (Inclusion inc : inclusions) {
 				if (!inc.library) {
-					File file = getClasspathElement(getDependancy(inc, mavenProject), mavenProject);
+					File file = getClasspathElement(getDependency(inc, mavenProject), mavenProject);
 					inPath.add(file.toString());
 					log.debug("--- ADD injars:" + inc.artifactId);
-					StringBuffer filter = new StringBuffer(fileToString(file));
+					StringBuilder filter = new StringBuilder(fileToString(file));
 					filter.append("(!META-INF/MANIFEST.MF");
 					if (!addMavenDescriptor) {
 						filter.append(",");
@@ -417,17 +473,21 @@ public class ProGuardMojo extends AbstractMojo {
 					hasInclusionLibrary = true;
 					log.debug("--- ADD libraryjars:" + inc.artifactId);
 					// This may not be CompileArtifacts, maven 2.0.6 bug
-					File file = getClasspathElement(getDependancy(inc, mavenProject), mavenProject);
+					File file = getClasspathElement(getDependency(inc, mavenProject), mavenProject);
 					inPath.add(file.toString());
-					args.add("-libraryjars");
-					args.add(fileToString(file));
+					if(putLibraryJarsInTempDir){
+						libraryJars.add(file);
+					} else {
+						args.add("-libraryjars");
+						args.add(fileToString(file));
+					}
 				}
 			}
 		}
 
 		if (inJarFile.exists()) {
 			args.add("-injars");
-			StringBuffer filter = new StringBuffer(fileToString(inJarFile));
+			StringBuilder filter = new StringBuilder(fileToString(inJarFile));
 			if ((inFilter != null) || (!addMavenDescriptor)) {
 				filter.append("(");
 				boolean coma = false;
@@ -451,9 +511,9 @@ public class ProGuardMojo extends AbstractMojo {
 
 
 		if (includeDependency) {
-			List dependency = this.mavenProject.getCompileArtifacts();
-			for (Iterator i = dependency.iterator(); i.hasNext();) {
-				Artifact artifact = (Artifact) i.next();
+			@SuppressWarnings("unchecked")
+			List<Artifact> dependency = this.mavenProject.getCompileArtifacts();
+			for (Artifact artifact : dependency) {
 				// dependency filter
 				if (isExclusion(artifact)) {
 					continue;
@@ -464,21 +524,25 @@ public class ProGuardMojo extends AbstractMojo {
 					log.debug("--- ignore library since one in injar:" + artifact.getArtifactId());
 					continue;
 				}
-				if(includeDependencyInjar){
+				if (includeDependencyInjar) {
 					log.debug("--- ADD library as injars:" + artifact.getArtifactId());
 					args.add("-injars");
+					args.add(fileToString(file));
 				} else {
 					log.debug("--- ADD libraryjars:" + artifact.getArtifactId());
-					args.add("-libraryjars");
-
+					if (putLibraryJarsInTempDir) {
+						libraryJars.add(file);
+					} else {
+						args.add("-libraryjars");
+						args.add(fileToString(file));
+					}
 				}
-				args.add(fileToString(file));
 			}
 		}
 
 		if (args.contains("-injars")) {
 			args.add("-outjars");
-			StringBuffer filter = new StringBuffer(fileToString(outJarFile));
+			StringBuilder filter = new StringBuilder(fileToString(outJarFile));
 			if (outFilter != null) {
 				filter.append("(").append(outFilter).append(")");
 			}
@@ -500,11 +564,31 @@ public class ProGuardMojo extends AbstractMojo {
 		}
 
 		if (libs != null) {
-			for (Iterator i = libs.iterator(); i.hasNext();) {
-				Object lib = i.next();
-				args.add("-libraryjars");
-				args.add(fileNameToString(lib.toString()));
+			for (String lib : libs) {
+				if (putLibraryJarsInTempDir) {
+					libraryJars.add(new File(lib));
+				} else {
+					args.add("-libraryjars");
+					args.add(fileNameToString(lib));
+				}
 			}
+		}
+
+		if (!libraryJars.isEmpty()) {
+			log.debug("Copy libraryJars to temporary directory");
+			log.debug("Temporary directory: " + tempLibraryjarsDir);
+			if (!tempLibraryjarsDir.mkdir()) {
+				throw new MojoFailureException("Can't create temporary libraryJars directory: " + tempLibraryjarsDir.getAbsolutePath());
+			}
+			for (File libraryJar : libraryJars) {
+				try {
+					FileUtils.copyFileToDirectory(libraryJar, tempLibraryjarsDir);
+				} catch (IOException e) {
+					throw new MojoFailureException("Can't copy to temporary libraryJars directory", e);
+				}
+			}
+			args.add("-libraryjars");
+			args.add(fileToString(tempLibraryjarsDir));
 		}
 
 		args.add("-printmapping");
@@ -518,13 +602,16 @@ public class ProGuardMojo extends AbstractMojo {
 		}
 
 		if (options != null) {
-			for (int i = 0; i < options.length; i++) {
-				args.add(options[i]);
-			}
+			Collections.addAll(args, options);
 		}
 
 		log.info("execute ProGuard " + args.toString());
 		proguardMain(getProguardJar(this), args, this);
+
+
+		if (!libraryJars.isEmpty()) {
+			deleteFileOrDirectory(tempLibraryjarsDir);
+		}
 
 		if ((assembly != null) && (hasInclusionLibrary)) {
 
@@ -548,12 +635,12 @@ public class ProGuardMojo extends AbstractMojo {
 
 			try {
 				jarArchiver.addArchivedFileSet(baseFile);
-
-				for (Iterator iter = assembly.inclusions.iterator(); iter.hasNext();) {
-					Inclusion inc = (Inclusion) iter.next();
+				@SuppressWarnings("unchecked")
+				final List<Inclusion> inclusions = assembly.inclusions;
+				for (Inclusion inc : inclusions) {
 					if (inc.library) {
 						File file;
-						Artifact artifact = getDependancy(inc, mavenProject);
+						Artifact artifact = getDependency(inc, mavenProject);
 						file = getClasspathElement(artifact, mavenProject);
 						if (file.isDirectory()) {
 							getLog().info("merge project: " + artifact.getArtifactId() + " " + file);
@@ -574,24 +661,64 @@ public class ProGuardMojo extends AbstractMojo {
 		}
 
 		if (attach && !sameArtifact) {
+			final String classifier;
 			if (useArtifactClassifier()) {
-				projectHelper.attachArtifact(mavenProject, attachArtifactType, attachArtifactClassifier, outJarFile);
+				classifier = attachArtifactClassifier;
 			} else {
-				projectHelper.attachArtifact(mavenProject, attachArtifactType, null, outJarFile);
+				classifier = null;
+			}
+			projectHelper.attachArtifact(mavenProject, attachArtifactType, classifier, outJarFile);
+
+			final String mainClassifier = useArtifactClassifier() ? attachArtifactClassifier : null;
+			final File buildOutput = new File(mavenProject.getBuild().getDirectory());
+			if (attachMap) {
+				attachTextFile(new File(buildOutput, mappingFileName), mainClassifier, "map");
+			}
+			if (attachSeed) {
+				attachTextFile(new File(buildOutput, seedFileName), mainClassifier, "seed");
 			}
 		}
 	}
 
-	private static File getProguardJar(ProGuardMojo mojo) throws MojoExecutionException {
+	private void attachTextFile(File theFile, String mainClassifier, String suffix) {
+		final String classifier = (null == mainClassifier ? "" : mainClassifier+"-") + suffix;
+		log.info("Attempting to attach "+suffix+" artifact");
+		if (theFile.exists()) {
+			if (theFile.isFile()) {
+				projectHelper.attachArtifact(mavenProject, "txt", classifier, theFile);
+			} else {
+				log.warn("Cannot attach file because it is not a file: "+theFile);
+			}
+		} else {
+			log.warn("Cannot attach file because it does not exist: "+theFile);
+
+		}
+	}
+
+	private File getProguardJar(ProGuardMojo mojo) throws MojoExecutionException {
+
+		if (proguardJar != null) {
+			if (proguardJar.exists()) {
+				if (proguardJar.isFile()) {
+					return proguardJar;
+				} else {
+					mojo.getLog().warn("proguard jar (" + proguardJar + ") is not a file");
+					throw new MojoExecutionException("proguard jar (" + proguardJar + ") is not a file");
+				}
+			} else {
+				mojo.getLog().warn("proguard jar (" + proguardJar + ") does not exist");
+				throw new MojoExecutionException("proguard jar (" + proguardJar + ") does not exist");
+			}
+		}
 
 		Artifact proguardArtifact = null;
 		int proguardArtifactDistance = -1;
 		// This should be solved in Maven 2.1
-		for (Iterator i = mojo.pluginArtifacts.iterator(); i.hasNext();) {
-			Artifact artifact = (Artifact) i.next();
+		for (Artifact artifact : mojo.pluginArtifacts) {
 			mojo.getLog().debug("pluginArtifact: " + artifact.getFile());
-			if (artifact.getArtifactId().startsWith("proguard") &&
-			   !artifact.getArtifactId().startsWith("proguard-maven-plugin")) {
+			final String artifactId = artifact.getArtifactId();
+			if (artifactId.startsWith((useDexGuard?"dexguard":"proguard")) &&
+				!artifactId.startsWith("proguard-maven-plugin")) {
 				int distance = artifact.getDependencyTrail().size();
 				mojo.getLog().debug("proguard DependencyTrail: " + distance);
 				if ((mojo.proguardVersion != null) && (mojo.proguardVersion.equals(artifact.getVersion()))) {
@@ -610,7 +737,7 @@ public class ProGuardMojo extends AbstractMojo {
 			mojo.getLog().debug("proguardArtifact: " + proguardArtifact.getFile());
 			return proguardArtifact.getFile().getAbsoluteFile();
 		}
-		mojo.getLog().info("proguard jar not found in pluginArtifacts");
+		mojo.getLog().info((useDexGuard?"dexguard":"proguard") + " jar not found in pluginArtifacts");
 
 		ClassLoader cl;
 		cl = mojo.getClass().getClassLoader();
@@ -631,7 +758,7 @@ public class ProGuardMojo extends AbstractMojo {
 		return new File(proguardJar);
 	}
 
-	private static void proguardMain(File proguardJar, ArrayList argsList, ProGuardMojo mojo)
+	private void proguardMain(File proguardJar, List<String> argsList, ProGuardMojo mojo)
 			throws MojoExecutionException {
 
 		Java java = new Java();
@@ -643,7 +770,8 @@ public class ProGuardMojo extends AbstractMojo {
 		DefaultLogger antLogger = new DefaultLogger();
 		antLogger.setOutputPrintStream(System.out);
 		antLogger.setErrorPrintStream(System.err);
-		antLogger.setMessageOutputLevel(mojo.log.isDebugEnabled() ? Project.MSG_DEBUG : Project.MSG_INFO);
+		int logLevel = mojo.log.isDebugEnabled() ? Project.MSG_DEBUG : Project.MSG_INFO;
+		antLogger.setMessageOutputLevel(silent ? Project.MSG_ERR : logLevel);
 
 		antProject.addBuildListener(antLogger);
 		antProject.setBaseDir(mojo.mavenProject.getBasedir());
@@ -666,8 +794,8 @@ public class ProGuardMojo extends AbstractMojo {
 			java.setMaxmemory(mojo.maxMemory);
 		}
 
-		for (Iterator i = argsList.iterator(); i.hasNext();) {
-			java.createArg().setValue(i.next().toString());
+		for (String arg : argsList) {
+			java.createArg().setValue(arg);
 		}
 
 		int result = java.executeJava();
@@ -676,39 +804,41 @@ public class ProGuardMojo extends AbstractMojo {
 		}
 	}
 
-	private static String nameNoType(String fileName) {
-	    int extStart = fileName.lastIndexOf('.');
-	    if (extStart == -1) {
-	        return fileName;
-	    }
+	private String nameNoType(String fileName) {
+		int extStart = fileName.lastIndexOf('.');
+		if (extStart == -1) {
+			return fileName;
+		}
 		return fileName.substring(0, extStart);
 	}
 
-	private static boolean deleteFileOrDirectory(File path) throws MojoFailureException {
-        if (path.isDirectory()) {
-            File[] files = path.listFiles();
-            for (int i = 0; i < files.length; i++) {
-                if (files[i].isDirectory()) {
-                    if (!deleteFileOrDirectory(files[i])) {
-                        throw new MojoFailureException("Can't delete dir " + files[i]);
-                    }
-                } else {
-                    if (!files[i].delete()) {
-                        throw new MojoFailureException("Can't delete file " + files[i]);
-                    }
-                }
-            }
-            return path.delete();
-        } else {
-            return path.delete();
-        }
-    }
+	private boolean deleteFileOrDirectory(File path) throws MojoFailureException {
+		if (path.isDirectory()) {
+			File[] files = path.listFiles();
+			if (null != files) {
+				for (File file : files) {
+					if (file.isDirectory()) {
+						if (!deleteFileOrDirectory(file)) {
+							throw new MojoFailureException("Can't delete dir " + file);
+						}
+					} else {
+						if (!file.delete()) {
+							throw new MojoFailureException("Can't delete file " + file);
+						}
+					}
+				}
+			}
+			return path.delete();
+		} else {
+			return path.delete();
+		}
+	}
 
 
-	private static Artifact getDependancy(Inclusion inc, MavenProject mavenProject) throws MojoExecutionException {
-		Set dependancy = mavenProject.getArtifacts();
-		for (Iterator i = dependancy.iterator(); i.hasNext();) {
-			Artifact artifact = (Artifact) i.next();
+	private Artifact getDependency(Inclusion inc, MavenProject mavenProject) throws MojoExecutionException {
+		@SuppressWarnings("unchecked")
+		Set<Artifact> dependency = mavenProject.getArtifacts();
+		for (Artifact artifact : dependency) {
 			if (inc.match(artifact)) {
 				return artifact;
 			}
@@ -720,8 +850,7 @@ public class ProGuardMojo extends AbstractMojo {
 		if (exclusions == null) {
 			return false;
 		}
-		for (Iterator iter = exclusions.iterator(); iter.hasNext();) {
-			Exclusion excl = (Exclusion) iter.next();
+		for (Exclusion excl : exclusions) {
 			if (excl.match(artifact)) {
 				return true;
 			}
@@ -729,7 +858,7 @@ public class ProGuardMojo extends AbstractMojo {
 		return false;
 	}
 
-	private static File getClasspathElement(Artifact artifact, MavenProject mavenProject) throws MojoExecutionException {
+	private File getClasspathElement(Artifact artifact, MavenProject mavenProject) throws MojoExecutionException {
 		if (artifact.getClassifier() != null) {
 			return artifact.getFile();
 		}
